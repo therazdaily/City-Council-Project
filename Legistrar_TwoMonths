@@ -1,0 +1,64 @@
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+
+API_BASE = 'https://webapi.legistar.com/v1/santaclara'
+WEB_BASE = 'https://santaclara.legistar.com'
+
+def fetch_meetings():
+    today = datetime.today()
+    date_from = (today - timedelta(days=60)).strftime('%Y-%m-%dT00:00:00')
+    date_to = (today + timedelta(days=60)).strftime('%Y-%m-%dT23:59:59')
+
+    events, skip = [], 0
+    while True:
+        url = (
+            f"{API_BASE}/events?$top=1000&$skip={skip}"
+            f"&$orderby=EventDate desc"
+            f"&$filter=EventDate ge datetime'{date_from}' and EventDate le datetime'{date_to}'"
+        )
+        batch = requests.get(url, timeout=30).json()
+        if not batch:
+            break
+        events.extend(batch)
+        if len(batch) < 1000:
+            break
+        skip += 1000
+
+    return pd.DataFrame(parse_event(e) for e in events)
+
+def parse_event(e):
+    eid, guid = e.get('EventId', ''), e.get('EventGuid', '')
+    body_id = e.get('EventBodyId', '')
+
+    agenda_ok  = e.get('EventAgendaStatusName', '') not in ('', 'Not\xa0available', 'Not available')
+    minutes_ok = e.get('EventMinutesStatusName', '') not in ('', 'Not\xa0available', 'Not available')
+    packet_ok  = bool(e.get('EventInAgendaPacket'))
+
+    try:
+        dt = datetime.fromisoformat(e['EventDate'].replace('Z', ''))
+        date_str = f"{dt.month}/{dt.day}/{dt.year}"
+    except Exception:
+        date_str = e.get('EventDate', '')
+
+    return {
+        'department':          e.get('EventBodyName', ''),
+        'date':                date_str,
+        'time':                e.get('EventTime', ''),
+        'location':            e.get('EventLocation', ''),
+        'meeting_details_url': f"{WEB_BASE}/MeetingDetail.aspx?ID={eid}&GUID={guid}&Options=info|&Search=",
+        'agenda_url':          f"{WEB_BASE}/View.ashx?M=A&ID={eid}&GUID={guid}" if agenda_ok else '',
+        'agenda_status':       e.get('EventAgendaStatusName', ''),
+        'minutes_url':         f"{WEB_BASE}/View.ashx?M=M&ID={eid}&GUID={guid}" if minutes_ok else '',
+        'minutes_status':      e.get('EventMinutesStatusName', ''),
+        'packet_url':          f"{WEB_BASE}/View.ashx?M=E2&ID={eid}&GUID={guid}" if packet_ok else '',
+        'icalendar_url':       f"{WEB_BASE}/View.ashx?M=IC&ID={eid}&GUID={guid}",
+        'department_url':      f"{WEB_BASE}/DepartmentDetail.aspx?ID={body_id}&GUID=" if body_id else '',
+        'comment':             e.get('EventComment', ''),
+    }
+
+df = fetch_meetings()
+print(f"Fetched {len(df)} meetings across {df['department'].nunique()} departments")
+
+df.to_csv('../SantaClara_legistar_meetings.csv', index=False)
+print("Saved to SantaClara_legistar_meetings.csv")
