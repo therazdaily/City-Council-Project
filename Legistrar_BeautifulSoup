@@ -8,7 +8,7 @@ import time
 class SantaClaraLegistarScraper:
 
     def __init__(self):
-        self.base_url = 'https://santaclara.legistar.com/Calendar.aspx'
+        self.base_url = 'https://COUNTYNAME.legistar.com/Calendar.aspx'
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
