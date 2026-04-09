@@ -1,0 +1,493 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import pandas as pd
+import time
+
+
+class SantaClaraLegistarScraper:
+
+    def __init__(self):
+        self.base_url = 'https://santaclara.legistar.com/Calendar.aspx'
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+
+    def get_viewstate(self, soup):
+        """Extract ASP.NET ViewState for form submissions"""
+        viewstate = soup.find('input', {'id': '__VIEWSTATE'})
+        viewstategenerator = soup.find('input', {'id': '__VIEWSTATEGENERATOR'})
+        eventvalidation = soup.find('input', {'id': '__EVENTVALIDATION'})
+
+        return {
+            '__VIEWSTATE': viewstate['value'] if viewstate else '',
+            '__VIEWSTATEGENERATOR': viewstategenerator['value'] if viewstategenerator else '',
+            '__EVENTVALIDATION': eventvalidation['value'] if eventvalidation else ''
+        }
+
+    def scrape_page(self, soup):
+        """
+        Extract rows from the MAIN CALENDAR grid — the second table on the page.
+        The page contains two grids:
+          1. gridUpcomingMeetings  (first table  — skipped)
+          2. gridCalendar          (second table — targeted here)
+        Rows in the calendar grid carry IDs of the form:
+          ctl00_ContentPlaceHolder1_gridCalendar_ctl00__{N}
+        where N runs from 0 up to 2845 across all pages.
+        """
+
+        # ------------------------------------------------------------------ #
+        # 1. Locate the second grid div — gridCalendar (NOT gridUpcoming)     #
+        # ------------------------------------------------------------------ #
+        # Find BOTH grid divs so we can be sure we take the right one.
+        all_grids = soup.find_all('div', id=lambda x: x and 'grid' in x.lower()
+                                  and 'ContentPlaceHolder1' in x)
+
+        calendar_grid = soup.find('div', id='ctl00_ContentPlaceHolder1_gridCalendar')
+
+        if not calendar_grid:
+            print("  WARNING: Could not find ctl00_ContentPlaceHolder1_gridCalendar div!")
+            print(f"  DEBUG: Grid divs found on page: {[d.get('id') for d in all_grids]}")
+            return []
+
+        print(f"  Found calendar grid (second table on page)")
+
+        # ------------------------------------------------------------------ #
+        # 2. Drill into the table body                                         #
+        # ------------------------------------------------------------------ #
+        table = calendar_grid.find('table', class_='rgMasterTable')
+        if not table:
+            print("  WARNING: Could not find rgMasterTable inside calendar grid!")
+            return []
+
+        tbody = table.find('tbody')
+        if not tbody:
+            print("  WARNING: Could not find tbody inside rgMasterTable!")
+            return []
+
+        # ------------------------------------------------------------------ #
+        # 3. Build a fast lookup dict keyed by row ID                         #
+        #    Only rows whose ID belongs to gridCalendar are included;          #
+        #    any stray gridUpcomingMeetings rows are naturally excluded         #
+        #    because their IDs never match the pattern below.                  #
+        # ------------------------------------------------------------------ #
+        row_lookup = {}
+        for tr in tbody.find_all('tr', id=True):
+            tr_id = tr.get('id', '')
+            # Accept only calendar rows — pattern: gridCalendar_ctl00__{integer}
+            if 'gridCalendar_ctl00__' in tr_id and 'Upcoming' not in tr_id:
+                try:
+                    # Extract the trailing integer index
+                    suffix = int(tr_id.rsplit('__', 1)[-1])
+                    row_lookup[suffix] = tr
+                except ValueError:
+                    pass  # Not a plain integer suffix — skip
+
+        print(f"  Discovered {len(row_lookup)} calendar rows on this page "
+              f"(indices: {min(row_lookup) if row_lookup else 'n/a'} "
+              f"– {max(row_lookup) if row_lookup else 'n/a'})")
+
+        # ------------------------------------------------------------------ #
+        # 4. Iterate indices 0 → 2845 in order, parse whatever is present     #
+        # ------------------------------------------------------------------ #
+        data = []
+        for i in range(2846):          # 0 to 2845 inclusive
+            row = row_lookup.get(i)
+            if row is None:
+                continue               # This index isn't on the current page
+
+            row_data = self.parse_row(row)
+            if row_data:
+                data.append(row_data)
+            else:
+                print(f"  WARNING: Failed to parse calendar row index {i} "
+                      f"(id=ctl00_ContentPlaceHolder1_gridCalendar_ctl00__{i})")
+
+        print(f"  Successfully parsed {len(data)} records from this page")
+        return data
+
+    def parse_row(self, row):
+        """Extract data from a single table row"""
+        cells = row.find_all('td')
+
+        if len(cells) < 10:
+            return None
+
+        data = {}
+
+        try:
+            # Department/Commission Name (Column 0)
+            dept_link = cells[0].find('a')
+            if dept_link:
+                data['department'] = dept_link.text.strip()
+                data['department_url'] = urljoin(self.base_url, dept_link.get('href', ''))
+            else:
+                data['department'] = cells[0].text.strip()
+                data['department_url'] = ''
+
+            # Meeting Date (Column 1)
+            data['date'] = cells[1].text.strip()
+
+            # iCalendar link (Column 2)
+            ical_link = cells[2].find('a', id=lambda x: x and 'hypiCal' in x)
+            data['icalendar_url'] = urljoin(self.base_url, ical_link.get('href', '')) if ical_link else ''
+
+            # Time (Column 3)
+            time_span = cells[3].find('span', id=lambda x: x and 'lblTime' in x)
+            data['time'] = time_span.text.strip() if time_span else cells[3].text.strip()
+
+            # Location (Column 4)
+            data['location'] = cells[4].text.strip().replace('\n', ' ').replace('\r', ' ')
+
+            # Meeting Details link (Column 5)
+            details_link = cells[5].find('a', id=lambda x: x and 'hypMeetingDetail' in x)
+            data['meeting_details_url'] = urljoin(self.base_url, details_link.get('href', '')) if details_link else ''
+
+            # Agenda PDF (Column 6)
+            agenda_link = cells[6].find('a', id=lambda x: x and 'hypAgenda' in x)
+            if agenda_link and 'Not' not in agenda_link.text:
+                data['agenda_url'] = urljoin(self.base_url, agenda_link.get('href', ''))
+                data['agenda_available'] = True
+            else:
+                data['agenda_url'] = ''
+                data['agenda_available'] = False
+
+            # Accessible Agenda HTML (Column 7)
+            accessible_agenda = cells[7].find('a', id=lambda x: x and 'hypAccessibleAgendaHTML' in x)
+            if accessible_agenda and 'Not' not in accessible_agenda.text:
+                data['accessible_agenda_url'] = urljoin(self.base_url, accessible_agenda.get('href', ''))
+                data['accessible_agenda_available'] = True
+            else:
+                data['accessible_agenda_url'] = ''
+                data['accessible_agenda_available'] = False
+
+            # Minutes PDF (Column 8)
+            minutes_link = cells[8].find('a', id=lambda x: x and 'hypMinutes' in x)
+            if minutes_link and 'Not' not in minutes_link.text:
+                data['minutes_url'] = urljoin(self.base_url, minutes_link.get('href', ''))
+                data['minutes_available'] = True
+            else:
+                data['minutes_url'] = ''
+                data['minutes_available'] = False
+
+            # Accessible Minutes HTML (Column 9)
+            accessible_minutes = cells[9].find('a', id=lambda x: x and 'hypAccessibleMinutesHTML' in x)
+            if accessible_minutes and 'Not' not in accessible_minutes.text:
+                data['accessible_minutes_url'] = urljoin(self.base_url, accessible_minutes.get('href', ''))
+                data['accessible_minutes_available'] = True
+            else:
+                data['accessible_minutes_url'] = ''
+                data['accessible_minutes_available'] = False
+
+            # Packet (Column 10)
+            if len(cells) > 10:
+                packet_link = cells[10].find('a', id=lambda x: x and 'hypExtra2' in x)
+                if packet_link and 'Not' not in packet_link.text:
+                    data['packet_url'] = urljoin(self.base_url, packet_link.get('href', ''))
+                    data['packet_available'] = True
+                else:
+                    data['packet_url'] = ''
+                    data['packet_available'] = False
+            else:
+                data['packet_url'] = ''
+                data['packet_available'] = False
+
+            # Video/Audio (Column 11)
+            if len(cells) > 11:
+                video_link = cells[11].find('a', id=lambda x: x and 'hypVideo' in x)
+                if video_link and 'Not' not in video_link.text:
+                    data['video_available'] = True
+                    data['video_event_id'] = video_link.get('data-event-id', '')
+                else:
+                    data['video_available'] = False
+                    data['video_event_id'] = ''
+            else:
+                data['video_available'] = False
+                data['video_event_id'] = ''
+
+            # Caption Notes/Transcript (Column 12)
+            if len(cells) > 12:
+                transcript_link = cells[12].find('a', id=lambda x: x and 'hypTranscript' in x)
+                if transcript_link and 'Not' not in transcript_link.text:
+                    data['transcript_available'] = True
+                    data['transcript_event_id'] = transcript_link.get('data-event-id', '')
+                else:
+                    data['transcript_available'] = False
+                    data['transcript_event_id'] = ''
+            else:
+                data['transcript_available'] = False
+                data['transcript_event_id'] = ''
+
+            # eComment (Column 13)
+            if len(cells) > 13:
+                ecomment_link = cells[13].find('a', id=lambda x: x and 'hypeComment' in x)
+                if ecomment_link and 'Not' not in ecomment_link.text:
+                    data['ecomment_available'] = True
+                    data['ecomment_event_id'] = ecomment_link.get('data-event-id', '')
+                else:
+                    data['ecomment_available'] = False
+                    data['ecomment_event_id'] = ''
+            else:
+                data['ecomment_available'] = False
+                data['ecomment_event_id'] = ''
+
+        except Exception as e:
+            print(f"Error parsing row: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+        return data
+
+    def get_current_page_number(self, soup):
+        """Get the current page number from the calendar grid (second table)"""
+        calendar_grid = soup.find('div', id='ctl00_ContentPlaceHolder1_gridCalendar')
+        if calendar_grid:
+            current_page = calendar_grid.find('a', class_='rgCurrentPage')
+            if current_page:
+                try:
+                    return int(current_page.text.strip())
+                except:
+                    pass
+        return 1
+
+    def has_next_page(self, soup, current_page):
+        """Check if there's a next page in the calendar grid (second table)"""
+        calendar_grid = soup.find('div', id='ctl00_ContentPlaceHolder1_gridCalendar')
+        if not calendar_grid:
+            print("  DEBUG: Calendar grid not found for pagination check")
+            return False
+
+        pager = calendar_grid.find('div', class_='rgWrap rgNumPart')
+        if not pager:
+            print("  DEBUG: Pager not found")
+            return False
+
+        all_links = pager.find_all('a')
+        print(f"  DEBUG: Found {len(all_links)} pagination links in calendar grid")
+
+        for link in all_links:
+            onclick = link.get('onclick', '')
+            link_text = link.text.strip()
+            print(f"    Link text: '{link_text}', onclick: {onclick[:80] if onclick else 'none'}...")
+
+            if 'NavigateToPage' in onclick:
+                try:
+                    parts = onclick.split("'")
+                    if len(parts) >= 4:
+                        page_num = int(parts[3])
+                        if page_num > current_page:
+                            print(f"  DEBUG: Found next page: {page_num}")
+                            return True
+                except Exception as e:
+                    print(f"  DEBUG: Error parsing onclick: {e}")
+
+        next_buttons = pager.find_all('input', {'class': 'rgPageNext'})
+        for btn in next_buttons:
+            if 'disabled' not in btn.get('class', []):
+                print("  DEBUG: Found enabled Next button")
+                return True
+
+        print(f"  DEBUG: No next page found (current page: {current_page})")
+        return False
+
+    def navigate_to_page(self, page_num, viewstate_data):
+        """Navigate to a specific page of the calendar grid (second table)"""
+        print(f"  Navigating to page {page_num}...")
+
+        form_data = viewstate_data.copy()
+        form_data['__EVENTTARGET'] = 'ctl00$$ContentPlaceHolder1$$gridCalendar$$ctl00$$ctl02$$ctl00$$ctl04'
+        form_data['__EVENTARGUMENT'] = ''
+
+        response = self.session.post(
+            self.base_url,
+            data=form_data,
+            headers={
+                'Referer': self.base_url,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+        )
+
+        return BeautifulSoup(response.content, 'html.parser')
+
+    def scrape_all_pages(self, max_pages=None):
+        """Main method to scrape all pages of the calendar grid"""
+        print("Starting scrape of Santa Clara Legistar Calendar...")
+        print(f"URL: {self.base_url}\n")
+        print("NOTE: Page contains two tables. Targeting the SECOND (main calendar) grid.\n")
+
+        all_data = []
+        page = 1
+
+        print("Fetching initial page...")
+        response = self.session.get(self.base_url)
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        while True:
+            print(f"\n{'=' * 60}")
+            print(f"SCRAPING PAGE {page}")
+            print(f"{'=' * 60}")
+
+            page_data = self.scrape_page(soup)
+            all_data.extend(page_data)
+            print(f"  Extracted {len(page_data)} records from page {page}")
+            print(f"  Total records so far: {len(all_data)}")
+
+            if max_pages and page >= max_pages:
+                print(f"\nReached maximum page limit ({max_pages})")
+                break
+
+            current_page_num = self.get_current_page_number(soup)
+            print(f"  Current page number: {current_page_num}")
+
+            if not self.has_next_page(soup, current_page_num):
+                print(f"\n{'=' * 60}")
+                print(f"No more pages found. Completed scraping.")
+                print(f"{'=' * 60}")
+                break
+
+            viewstate_data = self.get_viewstate(soup)
+
+            page += 1
+            time.sleep(2)
+
+            try:
+                soup = self.navigate_to_page(page, viewstate_data)
+
+                new_page_data = self.scrape_page(soup)
+                if len(new_page_data) == 0:
+                    print("\nNo data on new page. Stopping.")
+                    break
+                if new_page_data == page_data:
+                    print("\nPage content identical to previous page. Stopping.")
+                    break
+
+            except Exception as e:
+                print(f"\nError navigating to page {page}: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+
+        print(f"\n{'=' * 60}")
+        print(f"SCRAPING COMPLETE")
+        print(f"{'=' * 60}")
+        print(f"Total pages scraped: {page}")
+        print(f"Total records collected: {len(all_data)}")
+
+        return pd.DataFrame(all_data)
+
+
+# ------------------------------------------------------------------ #
+# Entry point                                                          #
+# ------------------------------------------------------------------ #
+try:
+    scraper = SantaClaraLegistarScraper()
+
+    print("Starting data collection...")
+    df = scraper.scrape_all_pages()
+
+    if len(df) == 0:
+        print("\n" + "=" * 80)
+        print("WARNING: No data was collected!")
+        print("=" * 80)
+    else:
+        output_file = 'santa_clara_legistar_meetings.csv'
+        df.to_csv(output_file, index=False, encoding='utf-8')
+        print(f"\nData saved to: {output_file}")
+
+        print(f"\n{'=' * 80}")
+        print("DATA SUMMARY")
+        print(f"{'=' * 80}")
+        print(f"Total meetings: {len(df)}")
+        print(f"Columns collected: {len(df.columns)}")
+        print(f"Column names: {', '.join(df.columns.tolist())}")
+        print(f"\nDate range: {df['date'].min()} to {df['date'].max()}")
+        print(f"Unique departments: {df['department'].nunique()}")
+
+        print(f"\n{'=' * 80}")
+        print("TOP 10 DEPARTMENTS BY MEETING COUNT")
+        print(f"{'=' * 80}")
+        print(df['department'].value_counts().head(10))
+
+        print(f"\n{'=' * 80}")
+        print("DOCUMENT AVAILABILITY SUMMARY")
+        print(f"{'=' * 80}")
+        print(f"Agendas available:     {df['agenda_available'].sum():4d} / {len(df)} ({df['agenda_available'].sum() / len(df) * 100:.1f}%)")
+        print(f"Minutes available:     {df['minutes_available'].sum():4d} / {len(df)} ({df['minutes_available'].sum() / len(df) * 100:.1f}%)")
+        print(f"Packets available:     {df['packet_available'].sum():4d} / {len(df)} ({df['packet_available'].sum() / len(df) * 100:.1f}%)")
+        print(f"Videos available:      {df['video_available'].sum():4d} / {len(df)} ({df['video_available'].sum() / len(df) * 100:.1f}%)")
+        print(f"Transcripts available: {df['transcript_available'].sum():4d} / {len(df)} ({df['transcript_available'].sum() / len(df) * 100:.1f}%)")
+
+        print(f"\n{'=' * 80}")
+        print("SAMPLE DATA (first 10 records)")
+        print(f"{'=' * 80}")
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', 50)
+        print(df[['department', 'date', 'time', 'agenda_available', 'minutes_available', 'video_available']].head(10))
+
+        print(f"\n{'=' * 80}")
+        print("SAMPLE DOCUMENT URLs (first 3 meetings with agendas)")
+        print(f"{'=' * 80}")
+        sample = df[df['agenda_available'] == True].head(3)
+        for idx, row in sample.iterrows():
+            print(f"\n{idx + 1}. Department: {row['department']}")
+            print(f"   Date: {row['date']} at {row['time']}")
+            print(f"   Location: {row['location'][:60]}...")
+            print(f"   Agenda URL: {row['agenda_url']}")
+            if row['minutes_available']:
+                print(f"   Minutes URL: {row['minutes_url']}")
+            if row['packet_available']:
+                print(f"   Packet URL: {row['packet_url']}")
+
+        try:
+            excel_file = 'santa_clara_legistar_meetings.xlsx'
+            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='All Meetings', index=False)
+
+                summary_data = {
+                    'Metric': ['Total Meetings', 'Unique Departments', 'Date Range Start',
+                               'Date Range End', 'Agendas Available', 'Minutes Available',
+                               'Packets Available', 'Videos Available', 'Transcripts Available'],
+                    'Value': [len(df), df['department'].nunique(), df['date'].min(),
+                              df['date'].max(), df['agenda_available'].sum(),
+                              df['minutes_available'].sum(), df['packet_available'].sum(),
+                              df['video_available'].sum(), df['transcript_available'].sum()]
+                }
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+
+                dept_summary = df.groupby('department').agg({
+                    'date': 'count',
+                    'agenda_available': 'sum',
+                    'minutes_available': 'sum',
+                    'video_available': 'sum'
+                }).rename(columns={
+                    'date': 'Total Meetings',
+                    'agenda_available': 'Agendas',
+                    'minutes_available': 'Minutes',
+                    'video_available': 'Videos'
+                }).sort_values('Total Meetings', ascending=False)
+                dept_summary.to_excel(writer, sheet_name='By Department')
+
+            print(f"\nData also saved to Excel: {excel_file}")
+            print("  - Sheet 'All Meetings': Complete dataset")
+            print("  - Sheet 'Summary': Overview statistics")
+            print("  - Sheet 'By Department': Breakdown by department")
+
+        except Exception as e:
+            print(f"\nCouldn't save Excel file: {e}")
+            print("Note: Install openpyxl to save as Excel: pip install openpyxl")
+
+        print(f"\n{'=' * 80}")
+        print("SCRAPING COMPLETED SUCCESSFULLY!")
+        print(f"{'=' * 80}")
+
+except Exception as e:
+    print(f"\n{'=' * 80}")
+    print("ERROR OCCURRED!")
+    print(f"{'=' * 80}")
+    print(f"Error: {e}")
+    import traceback
+    traceback.print_exc()
+    print(f"\n{'=' * 80}")
